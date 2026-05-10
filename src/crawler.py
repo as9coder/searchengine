@@ -2,7 +2,7 @@ import asyncio
 import json
 import logging
 import time
-from urllib.parse import urljoin, urlparse, urldefrag, urlsplit
+from urllib.parse import urljoin, urlparse, urldefrag
 from pathlib import Path
 
 from bs4 import BeautifulSoup
@@ -12,6 +12,7 @@ from src.config import settings
 from src.database import async_session
 from src.models import CrawlQueue, Page, Link
 from src.extractor import extract_content
+from src.state import load_state, save_state
 
 logger = logging.getLogger(__name__)
 
@@ -28,9 +29,8 @@ TIER_1_DOMAINS = {
 
 TIER_2_DOMAINS = {
     "github.com", "medium.com", "dev.to", "towardsdatascience.com",
-    "neptune.ai", "dagshub.com", "neptune.ai", "comet.com",
-    "neptune.ai", "kaggle.com", "reddit.com", "stackexchange.com",
-    "stackoverflow.com", "hacker-news.firebaseio.com",
+    "neptune.ai", "dagshub.com", "comet.com", "kaggle.com",
+    "reddit.com", "stackexchange.com", "stackoverflow.com",
 }
 
 DOMAIN_DELAYS = {d: 0.3 for d in TIER_1_DOMAINS}
@@ -52,7 +52,6 @@ def get_domain(url: str) -> str:
 
 
 def get_tld_domain(url: str) -> str:
-    """Get base domain for rate limiting."""
     netloc = get_domain(url)
     parts = netloc.split(".")
     if len(parts) > 2:
@@ -131,7 +130,6 @@ def extract_links(html: str, base_url: str) -> list[str]:
 
 
 def extract_sitemap_links(html: str, base_url: str) -> list[str]:
-    """Extract URLs from sitemap XML."""
     try:
         soup = BeautifulSoup(html, "xml")
         urls = []
@@ -144,7 +142,6 @@ def extract_sitemap_links(html: str, base_url: str) -> list[str]:
 
 
 class StorageGuard:
-    """Monitor DB size and pause if approaching limit."""
     def __init__(self, max_gb: float = 180.0):
         self.max_bytes = max_gb * 1024 * 1024 * 1024
         self.db_path = Path("searchengine.db")
@@ -175,11 +172,72 @@ class Crawler:
             http2=True, follow_redirects=True,
         )
         self.semaphore = asyncio.Semaphore(settings.crawl_concurrency)
+        self.storage_guard = StorageGuard(max_gb=180.0)
+        
+        # Resume state
         self.domain_counts: dict[str, int] = {}
         self.domain_last_hit: dict[str, float] = {}
-        self.storage_guard = StorageGuard(max_gb=180.0)
-        self.seen_hashes: set[str] = set()  # In-memory dedup cache
+        self.seen_hashes: set[str] = set()
+        self.processed_since_save = 0
+        self._loaded = False
+    
+    async def _init_state(self):
+        """Resume from DB + disk state. Call once before crawling."""
+        if self._loaded:
+            return
+        self._loaded = True
         
+        # 1. Reset any stuck 'processing' URLs back to 'pending'
+        async with async_session() as session:
+            stuck = await session.execute(
+                update(CrawlQueue)
+                .where(CrawlQueue.status == "processing")
+                .values(status="pending")
+            )
+            if stuck.rowcount:
+                logger.info(f"Resumed {stuck.rowcount} stuck URLs back to pending")
+            await session.commit()
+        
+        # 2. Warm domain_counts from already-crawled pages in DB
+        async with async_session() as session:
+            result = await session.execute(
+                select(Page.domain, func.count()).where(Page.crawl_status == "crawled").group_by(Page.domain)
+            )
+            for domain, count in result.all():
+                self.domain_counts[domain] = count
+            logger.info(f"Loaded domain counts for {len(self.domain_counts)} domains from DB")
+        
+        # 3. Warm seen_hashes from DB (last 10k to keep memory sane)
+        async with async_session() as session:
+            result = await session.execute(
+                select(Page.text_hash).where(Page.text_hash.isnot(None)).order_by(Page.id.desc()).limit(10000)
+            )
+            for (h,) in result.all():
+                self.seen_hashes.add(h)
+            logger.info(f"Warmed {len(self.seen_hashes)} dedup hashes from DB")
+        
+        # 4. Load any additional state from disk
+        disk_state = load_state()
+        if disk_state:
+            logger.info(f"Loaded state from disk: {disk_state.get('processed_total', 0)} total processed")
+    
+    async def save_state(self):
+        """Persist state to disk."""
+        async with async_session() as session:
+            total = await session.execute(select(func.count()).select_from(Page))
+            pending = await session.execute(
+                select(func.count()).select_from(CrawlQueue).where(CrawlQueue.status == "pending")
+            )
+            state = {
+                "processed_total": total.scalar(),
+                "queue_pending": pending.scalar(),
+                "domains_crawled": len(self.domain_counts),
+                "hashes_cached": len(self.seen_hashes),
+                "saved_at": time.time(),
+            }
+            save_state(state)
+            logger.info(f"State saved: {state['processed_total']} pages, {state['queue_pending']} pending")
+    
     async def close(self):
         await self.client.aclose()
     
@@ -299,6 +357,7 @@ class Crawler:
                 session.add(page)
                 await session.commit()
                 self.seen_hashes.add(text_hash)
+                self.processed_since_save += 1
                 logger.info(f"Indexed [{extracted['content_type']}] {url} (Q:{extracted['quality_score']}, {extracted['word_count']} words)")
             
             # Extract and queue outgoing links
@@ -320,9 +379,15 @@ class Crawler:
             await session.execute(update(CrawlQueue).where(CrawlQueue.url == url).values(status="done"))
             await session.commit()
     
-    async def run(self):
+    async def run(self, shutdown_flag=None):
+        await self._init_state()
         logger.info("Crawler started. Storage guard: 180GB limit.")
+        
         while True:
+            if shutdown_flag and shutdown_flag():
+                logger.info("Shutdown flag set, finishing current batch...")
+                break
+            
             if not self.storage_guard.check():
                 gb = self.storage_guard.usage_gb()
                 logger.warning(f"Storage guard triggered: {gb:.1f}GB used. Pausing crawler.")
@@ -357,3 +422,8 @@ class Crawler:
             for res in results:
                 if isinstance(res, Exception):
                     logger.error(f"Crawl batch error: {res}")
+            
+            # Save state every 50 successfully processed pages
+            if self.processed_since_save >= 50:
+                await self.save_state()
+                self.processed_since_save = 0

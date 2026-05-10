@@ -2,6 +2,7 @@
 *.db-journal
 *.db-wal
 *.db-shm
+worker_state.json
 .env
 __pycache__/
 *.pyc
