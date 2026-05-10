@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ title or 'Untitled' }} | AI Search</title>
+    <link rel="stylesheet" href="/static/style.css">
+    <link rel="stylesheet" href="/static/view.css">
+</head>
+<body>
+    <div class="viewer-container">
+        <div class="viewer-header">
+            <a href="/" class="back-link">&#8592; Back to search</a>
+            <h1 class="viewer-title">{{ title or 'Untitled' }}</h1>
+            <div class="viewer-meta">
+                <span class="meta-domain">{{ domain }}</span>
+                <span class="meta-sep">|</span>
+                <span class="meta-type">{{ content_type }}</span>
+                <span class="meta-sep">|</span>
+                <span class="meta-quality">Q: {{ quality_score }}</span>
+                <span class="meta-sep">|</span>
+                <a href="{{ url }}" target="_blank" class="meta-original">View original &#8599;</a>
+                {% if author %}
+                <span class="meta-sep">|</span>
+                <span class="meta-author">{{ author }}</span>
+                {% endif %}
+                {% if crawled_at %}
+                <span class="meta-sep">|</span>
+                <span class="meta-date">Indexed: {{ crawled_at.strftime('%Y-%m-%d') }}</span>
+                {% endif %}
+            </div>
+        </div>
+        
+        <div class="viewer-content">
+            {{ content|safe }}
+        </div>
+    </div>
+</body>
+</html>

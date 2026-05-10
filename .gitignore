@@ -1,0 +1,14 @@
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+.env
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+node_modules/
+.DS_Store
+*.log

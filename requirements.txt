@@ -1,0 +1,11 @@
+fastapi[standard]
+uvicorn[standard]
+sqlalchemy[asyncio]
+aiosqlite
+httpx[http2]
+beautifulsoup4
+trafilatura
+markdownify
+python-dotenv
+pydantic-settings
+markdown
